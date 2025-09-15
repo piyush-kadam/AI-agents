@@ -92,30 +92,44 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\n```$", "", text)
     return text.strip()
 
+import concurrent.futures
+
 def generate_with_fallback(prompt: str, timeout_sec: int = 60):
     """
     Call Gemini models with fallback (pro -> flash).
     Returns tuple (text, model_name).
-    Raises RuntimeError if all models fail.
+    Raises RuntimeError if all models fail or timeout.
     """
     for model_name in ("gemini-1.5-pro", "gemini-1.5-flash"):
         try:
             logger.info(f"Calling model: {model_name}")
             model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt, timeout=timeout_sec)
+
+            # run with timeout
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(model.generate_content, prompt)
+                response = future.result(timeout=timeout_sec)
+
             text = clean_text(response.text)
             logger.info(f"Model {model_name} returned {len(text)} chars")
             return text, model_name
+
+        except concurrent.futures.TimeoutError:
+            logger.error(f"Model {model_name} timed out after {timeout_sec}s")
+            if model_name == "gemini-1.5-flash":
+                raise RuntimeError("All models timed out")
+            continue
         except google_exceptions.ResourceExhausted:
             logger.warning(f"{model_name} quota exhausted — trying fallback")
             continue
         except Exception as e:
             logger.exception(f"Model {model_name} error: {e}")
-            # try next model (unless last)
             if model_name == "gemini-1.5-flash":
                 raise
             continue
+
     raise RuntimeError("All models failed")
+
 
 def parse_json_keys(text: str, keys):
     """
