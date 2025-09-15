@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import datetime
 import uuid
 import logging
+import concurrent.futures
 
 # ------------------ setup ------------------
 logging.basicConfig(level=logging.INFO)
@@ -32,11 +33,10 @@ app = FastAPI(title="Stratify AI Backend - Pipeline")
 OUTPUTS_DIR = Path("./outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True)
 
-# serve outputs as static files at /outputs (useful when deployed)
+# serve outputs as static files at /outputs
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
 
 # ------------------ CORS ------------------
-# Allow origins from env var CORS_ORIGINS (comma-separated) or allow all (*) by default.
 cors_origins = os.getenv("CORS_ORIGINS", "*")
 if cors_origins.strip() == "*":
     allow_origins = ["*"]
@@ -85,35 +85,23 @@ FANTASY_KEYWORDS = {
 
 # ------------------ helpers ------------------
 def clean_text(text: str) -> str:
-    """Strip common code fences and return trimmed text."""
     if text is None:
         return ""
     text = re.sub(r"^```[\w-]*\n", "", text)
     text = re.sub(r"\n```$", "", text)
     return text.strip()
 
-import concurrent.futures
-
 def generate_with_fallback(prompt: str, timeout_sec: int = 60):
-    """
-    Call Gemini models with fallback (pro -> flash).
-    Returns tuple (text, model_name).
-    Raises RuntimeError if all models fail or timeout.
-    """
     for model_name in ("gemini-1.5-pro", "gemini-1.5-flash"):
         try:
             logger.info(f"Calling model: {model_name}")
             model = genai.GenerativeModel(model_name)
-
-            # run with timeout
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(model.generate_content, prompt)
                 response = future.result(timeout=timeout_sec)
-
             text = clean_text(response.text)
             logger.info(f"Model {model_name} returned {len(text)} chars")
             return text, model_name
-
         except concurrent.futures.TimeoutError:
             logger.error(f"Model {model_name} timed out after {timeout_sec}s")
             if model_name == "gemini-1.5-flash":
@@ -127,14 +115,9 @@ def generate_with_fallback(prompt: str, timeout_sec: int = 60):
             if model_name == "gemini-1.5-flash":
                 raise
             continue
-
     raise RuntimeError("All models failed")
 
-
 def parse_json_keys(text: str, keys):
-    """
-    Try JSON parse. If that fails, use a regex extraction fallback for each key.
-    """
     try:
         data = json.loads(text)
         for k in keys:
@@ -152,7 +135,7 @@ def is_fantasy_idea(idea: str) -> bool:
     lower = idea.lower()
     return any(k in lower for k in FANTASY_KEYWORDS)
 
-# ------------------ internal agents (core prompts) ------------------
+# ------------------ internal agents ------------------
 def refine_idea_internal(idea: str):
     prompt = f"""
 You are a startup mentor. Take this rough idea and refine it into a structured startup format.
@@ -183,7 +166,7 @@ Why Now: {refined.get('why_now')}
 Respond ONLY in JSON:
 {{
   "mvp_flow": [ 
-     {{ "step":1, "feature":"...", "description":"..." }},
+     {{ "step":1, "feature":"...", "description":"..." }} ,
      ...
   ]
 }}
@@ -199,14 +182,27 @@ Respond ONLY in JSON:
 
 def generate_tech_stack_internal(mvp_flow_text: str):
     prompt = f"""
-You are a tech architect. Given an MVP flow (JSON or text), recommend a detailed tech stack and a step-by-step implementation plan.
+You are a tech architect. Given an MVP flow (JSON or text), recommend a **detailed tech stack** and step-by-step implementation plan.
+
+IMPORTANT RULES:
+- For mobile apps, always suggest Flutter or React Native.
+- For backend, Node.js or Python are acceptable.
+- For payments in India, always suggest Razorpay instead of Stripe/PayPal.
+- Include all details: frontend frameworks, backend framework, database, cloud provider, other libraries/tools, payment, notifications, analytics, CI/CD.
+- Implementation plan should have step numbers, titles, description, and tasks.
 
 MVP Flow:
 {mvp_flow_text}
 
 Respond ONLY in JSON:
 {{
-  "tech_stack": {{ "frontend":"", "backend":"", "database":"", "cloud":"", "other":[] }},
+  "tech_stack": {{
+      "frontend": "",
+      "backend": "",
+      "database": "",
+      "cloud": "",
+      "other": []
+  }},
   "implementation_plan": [ {{ "step":1, "title":"", "description":"", "tasks":[...] }}, ... ]
 }}
 """
@@ -226,9 +222,6 @@ async def health():
 
 @app.post("/refine_idea", response_model=IdeaResponse)
 async def refine_idea(req: IdeaRequest):
-    """
-    Refine a rough idea into problem/solution/target_audience/why_now
-    """
     if is_fantasy_idea(req.idea):
         return {
             "problem": "Idea not feasible or unclear",
@@ -254,23 +247,14 @@ async def generate_tech_stack(req: TechStackRequest):
     parsed, raw, model_used = generate_tech_stack_internal(req.mvp_flow)
     tech = parsed.get("tech_stack", parsed)
     impl = parsed.get("implementation_plan", parsed)
-    # Return JSON strings so the FastAPI response_model matches (string fields)
     return {"tech_stack": json.dumps(tech), "implementation_plan": json.dumps(impl)}
 
 @app.post("/run_pipeline")
 async def run_pipeline(req: IdeaRequest, request: Request):
-    """
-    Runs the pipeline:
-      1) refine idea
-      2) generate mvp
-      3) generate tech stack
-    Saves outputs JSON to ./outputs/<run_id>.json and returns combined object.
-    """
     idea = req.idea.strip()
     run_id = uuid.uuid4().hex[:8]
     timestamp = datetime.utcnow().isoformat()
 
-    # quick deterministic fantasy check
     if is_fantasy_idea(idea):
         result = {
             "id": run_id,
@@ -289,7 +273,6 @@ async def run_pipeline(req: IdeaRequest, request: Request):
         out_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
 
-    # 1) refine
     try:
         refined, raw_refine_text, model_refine = refine_idea_internal(idea)
     except Exception as e:
@@ -310,21 +293,18 @@ async def run_pipeline(req: IdeaRequest, request: Request):
         out_file.write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
 
-    # 2) mvp
     try:
         mvp_parsed, raw_mvp_text, model_mvp = generate_mvp_internal(refined)
     except Exception as e:
         logger.exception("MVP generation failed")
         return {"error": f"MVP generation failed: {str(e)}"}
 
-    # 3) tech stack + implementation plan
     try:
         tech_parsed, raw_tech_text, model_tech = generate_tech_stack_internal(json.dumps(mvp_parsed))
     except Exception as e:
         logger.exception("Tech stack generation failed")
         return {"error": f"Tech stack generation failed: {str(e)}"}
 
-    # Build output object
     out_obj = {
         "id": run_id,
         "timestamp": timestamp,
@@ -340,15 +320,12 @@ async def run_pipeline(req: IdeaRequest, request: Request):
         "model_tech": model_tech
     }
 
-    # save
     out_file = OUTPUTS_DIR / f"{run_id}.json"
     out_file.write_text(json.dumps(out_obj, indent=2), encoding="utf-8")
-
     return out_obj
 
-# ------------------ run server (for local dev / simple deployment) ------------------
+# ------------------ run server ------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    # Point uvicorn to this module's app: main:app
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
