@@ -100,7 +100,7 @@ def generate_with_fallback(prompt: str, timeout_sec: int = 60):
     Returns tuple (text, model_name).
     Raises RuntimeError if all models fail or timeout.
     """
-    for model_name in ("gemini-1.5-pro", "gemini-1.5-flash"):
+    for model_name in ("gemini-2.5-pro", "gemini-2.5-flash"):
         try:
             logger.info(f"Calling model: {model_name}")
             model = genai.GenerativeModel(model_name)
